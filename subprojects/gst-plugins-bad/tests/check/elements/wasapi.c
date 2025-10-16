@@ -25,6 +25,8 @@
 #include <gst/gst.h>
 #include <gst/check/gstcheck.h>
 
+#include "../../sys/wasapi/gstwasapisrc.h"
+
 typedef struct
 {
   GMainLoop *loop;
@@ -155,6 +157,173 @@ GST_END_TEST;
 typedef struct
 {
   GMainLoop *loop;
+  GstElement *pipeline;
+  GstElement *src;
+  guint total_buffers;
+  guint buffers_after_restart;
+  gboolean restart_requested;
+  gboolean restart_confirmed;
+  guint timeout_id;
+} SrcRestartTestData;
+
+static gboolean
+restart_timeout_cb (SrcRestartTestData * data)
+{
+  GST_UNUSED (data);
+  /* If we hit the timeout, fail the test */
+  fail_unless (FALSE, "Timed out waiting for wasapisrc restart");
+
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+restart_bus_handler (GstBus * bus, GstMessage * message, SrcRestartTestData * data)
+{
+  GST_UNUSED (bus);
+  GST_UNUSED (data);
+
+  if (GST_MESSAGE_TYPE (message) == GST_MESSAGE_ERROR) {
+    fail_unless (FALSE, "Pipeline error during restart test");
+  }
+
+  return TRUE;
+}
+
+static gboolean
+trigger_src_restart (SrcRestartTestData * data)
+{
+  GstPad *srcpad;
+  GstAudioSrcClass *klass;
+
+  GST_INFO ("Trigger wasapisrc restart via flush events");
+
+  srcpad = gst_element_get_static_pad (data->src, "src");
+  fail_unless (srcpad != NULL);
+
+  fail_unless (gst_pad_send_event (srcpad, gst_event_new_flush_start ()),
+      "Failed to send FLUSH_START event");
+  fail_unless (gst_pad_send_event (srcpad, gst_event_new_flush_stop (TRUE)),
+      "Failed to send FLUSH_STOP event");
+  gst_object_unref (srcpad);
+
+  klass = GST_AUDIO_SRC_GET_CLASS (data->src);
+  fail_unless (klass != NULL);
+  fail_unless (klass->reset != NULL);
+  klass->reset (GST_AUDIO_SRC (data->src));
+
+  GST_OBJECT_LOCK (data->src);
+  fail_unless (GST_WASAPI_SRC (data->src)->client_needs_restart);
+  GST_OBJECT_UNLOCK (data->src);
+
+  data->restart_confirmed = TRUE;
+
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+handle_restart_handoff (SrcRestartTestData * data)
+{
+  gboolean needs_restart = FALSE;
+
+  data->total_buffers++;
+
+  if (!data->restart_requested && data->total_buffers >= 5) {
+    data->restart_requested = TRUE;
+    g_idle_add ((GSourceFunc) trigger_src_restart, data);
+    return G_SOURCE_REMOVE;
+  }
+
+  if (!data->restart_requested)
+    return G_SOURCE_REMOVE;
+
+  GST_OBJECT_LOCK (data->src);
+  needs_restart = GST_WASAPI_SRC (data->src)->client_needs_restart;
+  GST_OBJECT_UNLOCK (data->src);
+
+  if (data->restart_confirmed && !needs_restart)
+    data->buffers_after_restart++;
+
+  if (data->restart_confirmed && data->buffers_after_restart >= 5) {
+    if (data->timeout_id)
+      g_source_remove (data->timeout_id);
+    data->timeout_id = 0;
+    g_main_loop_quit (data->loop);
+  }
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+on_restart_sink_handoff (GstElement * element, GstBuffer * buffer, GstPad * pad,
+    SrcRestartTestData * data)
+{
+  GST_UNUSED (element);
+  GST_UNUSED (buffer);
+  GST_UNUSED (pad);
+
+  g_idle_add ((GSourceFunc) handle_restart_handoff, data);
+}
+
+static void
+wasapisrc_restart_after_flush (void)
+{
+  SrcRestartTestData data;
+  GstBus *bus;
+  GstElement *sink;
+
+  memset (&data, 0, sizeof (SrcRestartTestData));
+
+  data.loop = g_main_loop_new (NULL, FALSE);
+  data.pipeline = gst_parse_launch ("wasapisrc name=src provide-clock=false ! "
+      "queue ! fakesink name=sink async=false", NULL);
+  fail_unless (data.pipeline != NULL);
+
+  data.src = gst_bin_get_by_name (GST_BIN (data.pipeline), "src");
+  fail_unless (data.src != NULL);
+  sink = gst_bin_get_by_name (GST_BIN (data.pipeline), "sink");
+  fail_unless (sink != NULL);
+
+  g_object_set (sink, "signal-handoffs", TRUE, NULL);
+  g_signal_connect (sink, "handoff", G_CALLBACK (on_restart_sink_handoff),
+      &data);
+
+  bus = gst_element_get_bus (data.pipeline);
+  fail_unless (bus != NULL);
+  gst_bus_add_watch (bus, (GstBusFunc) restart_bus_handler, &data);
+
+  ASSERT_SET_STATE (data.pipeline, GST_STATE_PLAYING, GST_STATE_CHANGE_SUCCESS);
+
+  data.timeout_id = g_timeout_add_seconds (5,
+      (GSourceFunc) restart_timeout_cb, &data);
+
+  g_main_loop_run (data.loop);
+
+  fail_unless (data.restart_confirmed);
+  fail_unless (data.buffers_after_restart >= 5);
+
+  if (data.timeout_id)
+    g_source_remove (data.timeout_id);
+
+  ASSERT_SET_STATE (data.pipeline, GST_STATE_NULL, GST_STATE_CHANGE_SUCCESS);
+
+  gst_bus_remove_watch (bus);
+  gst_object_unref (bus);
+  gst_object_unref (sink);
+  gst_object_unref (data.src);
+  gst_object_unref (data.pipeline);
+  g_main_loop_unref (data.loop);
+}
+
+GST_START_TEST (test_wasapisrc_restart_after_flush)
+{
+  wasapisrc_restart_after_flush ();
+}
+
+GST_END_TEST;
+
+typedef struct
+{
+  GMainLoop *loop;
   GstElement *pipe;
   guint rem_st_changes;
   GstState reuse_state;
@@ -275,6 +444,7 @@ wasapi_suite (void)
     GST_INFO ("Skipping tests, wasapisrc/wasapisink are unavailable");
   } else {
     if (have_src) {
+      tcase_add_test (tc_basic, test_wasapisrc_restart_after_flush);
       tcase_add_test (tc_basic, test_wasapisrc_reuse_null);
       tcase_add_test (tc_basic, test_wasapisrc_reuse_ready);
     }

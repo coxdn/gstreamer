@@ -47,6 +47,26 @@
 GST_DEBUG_CATEGORY_STATIC (gst_wasapi_src_debug);
 #define GST_CAT_DEFAULT gst_wasapi_src_debug
 
+static gboolean
+gst_wasapi_src_is_device_lost_error (HRESULT hr)
+{
+  switch (hr) {
+    case AUDCLNT_E_DEVICE_INVALIDATED:
+    case AUDCLNT_E_SERVICE_NOT_RUNNING:
+#ifdef AUDCLNT_E_RESOURCES_INVALIDATED
+    case AUDCLNT_E_RESOURCES_INVALIDATED:
+#endif
+#ifdef AUDCLNT_E_ENDPOINT_CREATE_FAILED
+    case AUDCLNT_E_ENDPOINT_CREATE_FAILED:
+#endif
+      return TRUE;
+    default:
+      break;
+  }
+
+  return FALSE;
+}
+
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
@@ -810,6 +830,23 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
         length = 0;
         goto out;
       }
+      if (gst_wasapi_src_is_device_lost_error (hr)) {
+        gchar *msg = gst_wasapi_util_hresult_to_string (hr);
+        GST_WARNING_OBJECT (self,
+            "IAudioCaptureClient::GetBuffer reported device loss (%s),"
+            " scheduling restart", msg);
+        g_free (msg);
+
+        gst_wasapi_src_reset (asrc);
+
+        GST_OBJECT_LOCK (self);
+        self->client_needs_restart = TRUE;
+        gst_adapter_clear (self->adapter);
+        GST_OBJECT_UNLOCK (self);
+
+        length = 0;
+        goto out;
+      }
       HR_FAILED_ELEMENT_ERROR_AND (hr, IAudioCaptureClient::GetBuffer, self,
           goto err);
     }
@@ -864,8 +901,7 @@ out:
   return length;
 
 err:
-  length = -1;
-  goto out;
+  return (guint) GST_FLOW_ERROR;
 }
 
 static guint
